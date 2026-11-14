@@ -1,0 +1,165 @@
+name: Build unsigned IPA (raised token limits)
+
+# Builds the "On Device: LAS" app (OnDeviceLAS target) from a release tag with
+# the API's output/context limits for imported GGUF models raised, and
+# uploads an UNSIGNED .ipa. Sign and install it yourself with Sideloadly or
+# AltStore (free Apple ID: the app must be re-signed every 7 days).
+#
+# Run it from the Actions tab: "Build unsigned IPA (raised token limits)" >
+# "Run workflow". The .ipa is attached to the run as an artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or commit to build (3.2.6 build 146 is the last sideload release)"
+        default: "sideload-3.2.6-146"
+        required: true
+      max_output_tokens:
+        description: "Max reply tokens for imported GGUF models (was 256). The app still caps this at ~3840-4096 depending on device and heat"
+        default: "4096"
+        required: true
+      context_tokens:
+        description: "llama.cpp context for imported GGUF models (was 4096). Must exceed max_output_tokens by at least 576. Larger = more RAM"
+        default: "16384"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 150
+    env:
+      MAX_OUTPUT: ${{ inputs.max_output_tokens }}
+      CONTEXT: ${{ inputs.context_tokens }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$MAX_OUTPUT" =~ ^[0-9]+$ && "$CONTEXT" =~ ^[0-9]+$ ]] || { echo "::error::Token values must be whole numbers"; exit 1; }
+          # The app keeps context - output - 256 tokens for the prompt (floor 320)
+          if (( CONTEXT < MAX_OUTPUT + 576 )); then
+            echo "::error::context_tokens ($CONTEXT) must be at least max_output_tokens + 576 ($((MAX_OUTPUT + 576))), or the conversation history will not fit"
+            exit 1
+          fi
+          echo "Prompt budget after the change: $((CONTEXT - MAX_OUTPUT - 256)) tokens"
+
+      - name: Check out the app source
+        uses: actions/checkout@v4
+        with:
+          repository: Mesutcydev/ios-local-llm
+          ref: ${{ inputs.ref }}
+          submodules: false
+
+      - name: Select Xcode 26
+        run: |
+          set -euo pipefail
+          xcode=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          echo "Using $xcode"
+          sudo xcode-select -s "$xcode/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen cmake
+          command -v pod >/dev/null || sudo gem install cocoapods
+          xcodegen --version; pod --version; cmake --version | head -1
+
+      - name: Raise the token limits
+        run: |
+          set -euo pipefail
+          file=IOSLocalLLM/Services/CodingAssistantService.swift
+          # Only the chat/API helpers change; the camera "Lens" profile keeps its limits.
+          ctx_line='        return LlamaCppVLMExecutionProfile.resolve(repoID: repoID).contextSize'
+          out_line='        return LlamaCppVLMExecutionProfile.resolve(repoID: repoID).maxOutputTokens'
+          for line in "$ctx_line" "$out_line"; do
+            count=$(grep -cxF "$line" "$file" || true)
+            if [ "$count" != 1 ]; then
+              echo "::error::Expected exactly one line '$line' in $file, found $count. This ref's source differs; the patch needs updating."
+              exit 1
+            fi
+          done
+          perl -pi -e "s/^\Q$ctx_line\E\$/        return $CONTEXT \/\/ patched: was the 4K VLM profile/" "$file"
+          perl -pi -e "s/^\Q$out_line\E\$/        return $MAX_OUTPUT \/\/ patched: was 256/" "$file"
+          echo "--- patched helpers:"
+          grep -n -A4 "private static func importedGGUF\(ContextTokens\|MaxOutputTokens\)" "$file"
+          grep -q "return $CONTEXT // patched" "$file" && grep -q "return $MAX_OUTPUT // patched" "$file"
+
+      - name: Restore cached llama.xcframework
+        id: llama-cache
+        uses: actions/cache@v4
+        with:
+          path: ThirdParty/llama.cpp/build-apple/llama.xcframework
+          key: llama-xcframework-${{ runner.os }}-${{ hashFiles('Patches/llama.cpp-ios-only-xcframework.patch') }}-${{ inputs.ref }}
+
+      - name: Build llama.xcframework (pinned llama.cpp + the repo's iOS-only patch)
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # Same steps as scripts/build_native_frameworks.sh, without whisper.cpp
+          # (the OnDeviceLAS target only links llama.cpp).
+          cached=ThirdParty/llama.cpp/build-apple/llama.xcframework
+          git submodule update --init --recursive ThirdParty/llama.cpp
+          git -C ThirdParty/llama.cpp apply Patches/llama.cpp-ios-only-xcframework.patch
+          (cd ThirdParty/llama.cpp && IOS_ONLY=1 ./build-xcframework.sh)
+          test -d "$cached"
+
+      - name: Fetch llama.cpp headers (cache hit)
+        if: steps.llama-cache.outputs.cache-hit == 'true'
+        run: |
+          # The bridging header still needs the pinned llama.cpp headers
+          mv ThirdParty/llama.cpp/build-apple /tmp/build-apple
+          git submodule update --init ThirdParty/llama.cpp
+          mv /tmp/build-apple ThirdParty/llama.cpp/build-apple
+
+      - name: Generate the Xcode project
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          pod install
+
+      - name: Build the app (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -workspace OnDeviceLAS.xcworkspace \
+            -scheme OnDeviceLAS \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            | tee xcodebuild.log | grep -E "error:|warning: .*deprecated|\*\* BUILD" || true
+          grep -q "\*\* BUILD SUCCEEDED \*\*" xcodebuild.log
+
+      - name: Package the .ipa
+        run: |
+          set -euo pipefail
+          app=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          [ -n "$app" ] || { echo "::error::No .app produced"; exit 1; }
+          mkdir Payload
+          cp -R "$app" Payload/
+          name="OnDeviceLAS-${{ inputs.ref }}-out${MAX_OUTPUT}-ctx${CONTEXT}-unsigned.ipa"
+          zip -qry "$name" Payload
+          echo "IPA_NAME=$name" >> "$GITHUB_ENV"
+          ls -lh "$name"
+
+      - name: Upload the .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_NAME }}
+          path: ${{ env.IPA_NAME }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload the build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          if-no-files-found: ignore
