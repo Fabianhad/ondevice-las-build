@@ -15,9 +15,9 @@ Only `importedGGUFContextTokens` / `importedGGUFMaxOutputTokens` in
 ## Use
 
 1. **Actions** tab → **Build unsigned IPA (raised token limits)** → **Run workflow** (adjust the numbers if needed).
-2. Download the `.ipa` artifact from the finished run.
+2. Download the `-entitled.ipa` artifact from the finished run.
 3. Sign and install it with Sideloadly or AltStore using your Apple ID (free accounts: re-sign every 7 days).
 
 If the model fails to load after the change, run again with a smaller context (e.g. output 2048 / context 8192).
 
-The output is unsigned and unofficial. Upstream code is © its authors under its own license.
+The `.ipa` is fake-signed (ad-hoc, no certificate) with the app's memory entitlements embedded, like the official "sideload-entitled" release, so sideloading tools and entitlement injectors can pick them up. It is unofficial. Upstream code is © its authors under its own license.

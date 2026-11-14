@@ -136,14 +136,31 @@ jobs:
             | tee xcodebuild.log | grep -E "error:|warning: .*deprecated|\*\* BUILD" || true
           grep -q "\*\* BUILD SUCCEEDED \*\*" xcodebuild.log
 
-      - name: Package the .ipa
+      - name: Fake-sign with entitlements and package the .ipa
         run: |
           set -euo pipefail
           app=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
           [ -n "$app" ] || { echo "::error::No .app produced"; exit 1; }
           mkdir Payload
           cp -R "$app" Payload/
-          name="OnDeviceLAS-${{ inputs.ref }}-out${MAX_OUTPUT}-ctx${CONTEXT}-unsigned.ipa"
+          app="Payload/$(basename "$app")"
+
+          # Fake-sign (ad-hoc, no certificate) with the app's entitlements, like the
+          # official "sideload-entitled" release. Sideloading tools and entitlement
+          # injectors read the entitlements embedded in the binary; an unsigned
+          # build has none. Frameworks first, then the app.
+          find "$app/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) \
+            -exec codesign --force --sign - --timestamp=none {} \;
+          codesign --force --sign - --timestamp=none --generate-entitlement-der \
+            --entitlements IOSLocalLLM/IOSLocalLLM.entitlements "$app"
+          codesign --verify --deep --strict "$app"
+          echo "--- embedded entitlements:"
+          codesign -d --entitlements - --xml "$app" | tee entitlements.xml
+          for key in com.apple.developer.kernel.increased-memory-limit com.apple.developer.kernel.extended-virtual-addressing; do
+            grep -q "$key" entitlements.xml || { echo "::error::$key missing from the signature"; exit 1; }
+          done
+
+          name="OnDeviceLAS-${{ inputs.ref }}-out${MAX_OUTPUT}-ctx${CONTEXT}-entitled.ipa"
           zip -qry "$name" Payload
           echo "IPA_NAME=$name" >> "$GITHUB_ENV"
           ls -lh "$name"
