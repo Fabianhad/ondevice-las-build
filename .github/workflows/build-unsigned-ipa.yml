@@ -102,7 +102,7 @@ jobs:
           # (the OnDeviceLAS target only links llama.cpp).
           cached=ThirdParty/llama.cpp/build-apple/llama.xcframework
           git submodule update --init --recursive ThirdParty/llama.cpp
-          git -C ThirdParty/llama.cpp apply Patches/llama.cpp-ios-only-xcframework.patch
+          git -C ThirdParty/llama.cpp apply "$PWD/Patches/llama.cpp-ios-only-xcframework.patch"
           (cd ThirdParty/llama.cpp && IOS_ONLY=1 ./build-xcframework.sh)
           test -d "$cached"
 
