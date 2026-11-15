@@ -1,16 +1,17 @@
 diff --git a/IOSLocalLLM/ModelDownloadsView.swift b/IOSLocalLLM/ModelDownloadsView.swift
-index 6c012d2..d710869 100644
+index 6c012d2..d891043 100644
 --- a/IOSLocalLLM/ModelDownloadsView.swift
 +++ b/IOSLocalLLM/ModelDownloadsView.swift
-@@ -58,6 +58,7 @@ struct LASModelDownloadsView: View {
+@@ -58,6 +58,8 @@ struct LASModelDownloadsView: View {
                      } else {
                          headerCard
                          memoryCard
++                        LASGGUFContextCard()
 +                        LASLoRAAdapterCard(onChoose: chooseLoRAAdapter)
  
                      if models.isEmpty {
                          ContentUnavailableView(
-@@ -307,6 +308,17 @@ struct LASModelDownloadsView: View {
+@@ -307,6 +309,17 @@ struct LASModelDownloadsView: View {
          )
      }
  
@@ -28,10 +29,84 @@ index 6c012d2..d710869 100644
      private func importModel(at url: URL) async {
          isImportingModel = true
          importStatus = "Importing \(url.deletingPathExtension().lastPathComponent)…"
-@@ -588,6 +600,35 @@ private struct LASModelLibraryCard: View {
+@@ -588,6 +601,109 @@ private struct LASModelLibraryCard: View {
      }
  }
  
++/// Context length and max output for the selected imported GGUF model,
++/// saved per model, with a weights + KV-cache memory estimate.
++private struct LASGGUFContextCard: View {
++    @ObservedObject private var service = CodingAssistantService.shared
++    @ObservedObject private var store = GGUFContextSettingsStore.shared
++    @State private var shape: GGUFModelShape?
++
++    var body: some View {
++        let model = service.activeModel
++        if model.runtime == .llamaCpp, GGUFContextSettingsStore.applies(to: model.repoID) {
++            content(for: model)
++                .task(id: model.repoID) { shape = await Self.readShape(model) }
++        }
++    }
++
++    private func content(for model: AssistantModel) -> some View {
++        let limits = GGUFContextSettingsStore.limits(for: model.repoID)
++        let trained = shape?.trainedContext
++            ?? GGUFContextSettingsStore.trainedContext(for: model.repoID) ?? 0
++        let contexts = GGUFContextSettingsStore.contextChoices.filter { trained <= 0 || $0 <= trained }
++        let outputs = GGUFContextSettingsStore.outputChoices.filter {
++            $0 <= GGUFContextSettingsStore.maximumOutput(forContext: limits.context)
++        }
++        return VStack(alignment: .leading, spacing: LASDesignTokens.row) {
++            LASSectionLabel(title: "CONTEXT", trailing: model.displayName)
++            Text("Context length").font(.subheadline.weight(.semibold))
++            Picker("Context length", selection: Binding(
++                get: { limits.context },
++                set: { newContext in
++                    let output = min(limits.output, GGUFContextSettingsStore.maximumOutput(forContext: newContext))
++                    store.set(context: newContext, output: output, for: model.repoID)
++                }
++            )) {
++                ForEach(contexts, id: \.self) { Text(verbatim: "\($0 / 1_024)K").tag($0) }
++            }
++            .pickerStyle(.segmented)
++            Text("Max output").font(.subheadline.weight(.semibold))
++            Picker("Max output", selection: Binding(
++                get: { limits.output },
++                set: { store.set(context: limits.context, output: $0, for: model.repoID) }
++            )) {
++                ForEach(outputs, id: \.self) { Text(verbatim: "\($0)").tag($0) }
++            }
++            .pickerStyle(.segmented)
++            if let shape {
++                let needed = GGUFMemoryEstimate.totalBytes(shape, context: limits.context)
++                let kv = GGUFMemoryEstimate.kvBytes(elementsPerToken: shape.kvElementsPerToken, context: limits.context)
++                Text(verbatim: "About \(needed.formattedBytes) needed (weights \(shape.fileBytes.formattedBytes) + KV cache \(kv.formattedBytes)); \(GGUFMemoryEstimate.availableBytes.formattedBytes) available."
++                    + (trained > 0 ? " Trained context: \(trained / 1_024)K." : ""))
++                    .font(.caption.monospaced())
++                    .foregroundStyle(.secondary)
++                if GGUFMemoryEstimate.likelyExceeds(shape, context: limits.context) {
++                    Label("Likely more memory than this iPhone allows; iOS may close the app. Choose a smaller context.", systemImage: "exclamationmark.triangle")
++                        .font(.caption)
++                        .foregroundStyle(.orange)
++                }
++            }
++            Text("Bigger contexts use more memory. Context changes apply the next time the model loads; max output applies to the next reply.")
++                .font(.caption)
++                .foregroundStyle(.secondary)
++        }
++        .frame(maxWidth: .infinity, alignment: .leading)
++        .lasCard(radius: 22, padding: LASDesignTokens.component)
++    }
++
++    private static func readShape(_ model: AssistantModel) async -> GGUFModelShape? {
++        guard let directory = CodingAssistantService.preStagedDirectory(for: model),
++              let file = LocalModelFileValidator.ggufLLM(in: directory) else { return nil }
++        let shape = await Task.detached(priority: .utility) { GGUFModelShape.read(path: file.path) }.value
++        if let shape { GGUFContextSettingsStore.remember(shape, for: model.repoID) }
++        return shape
++    }
++}
++
 +/// Picks or clears the llama.cpp LoRA adapter applied to imported GGUF models.
 +private struct LASLoRAAdapterCard: View {
 +    @ObservedObject private var store = GGUFLoRAAdapterStore.shared
@@ -83,14 +158,140 @@ index 40973a5..ba48ed4 100644
              return .qwen35
          }
          if lower.contains("bonsai") { return .chatML }
+diff --git a/IOSLocalLLM/Models/ModelCapabilityProfile.swift b/IOSLocalLLM/Models/ModelCapabilityProfile.swift
+index 56f886b..fd1556c 100644
+--- a/IOSLocalLLM/Models/ModelCapabilityProfile.swift
++++ b/IOSLocalLLM/Models/ModelCapabilityProfile.swift
+@@ -133,13 +133,17 @@ struct ModelCapabilityProfile: Equatable, Sendable {
+     /// allocates lazily, so this is the fully-populated cache estimate rather
+     /// than memory charged immediately when the model loads.
+     let estimatedKVCacheBytes: Int64
++    /// Imported GGUF models: the user's max output, also used as the default
++    /// when a request sets no max_tokens. Nil keeps the formula below.
++    var defaultOutputOverride: Int? = nil
+ 
+     var effectiveContextWindow: Int {
+         min(configuredContextLength, maximumKVCacheTokens)
+     }
+ 
+     var defaultOutputTokens: Int {
+-        min(maximumOutputTokens, max(1, min(2_048, effectiveContextWindow / 4)))
++        if let defaultOutputOverride { return min(maximumOutputTokens, defaultOutputOverride) }
++        return min(maximumOutputTokens, max(1, min(2_048, effectiveContextWindow / 4)))
+     }
+ 
+     var runtimeLimits: LocalAPIRuntimeLimits {
+@@ -183,11 +187,42 @@ struct ModelCapabilityProfile: Equatable, Sendable {
+     }
+ 
+     static func resolve(for model: AssistantModel) -> Self {
+-        resolve(
++        let profile = resolve(
+             repoID: model.repoID,
+             catalogContextLength: model.contextWindowTokens,
+             supportsThinking: model.supportsThinking
+         )
++        // Imported GGUF models use the per-model context / max output chosen
++        // on the Models screen (default 32K / 4096) instead of the family
++        // guess (4K / 2048 for Bonsai). Other models are unchanged.
++        guard model.runtime == .llamaCpp,
++              GGUFContextSettingsStore.applies(to: model.repoID) else { return profile }
++        return profile.withGGUFLimits(repoID: model.repoID)
++    }
++
++    private func withGGUFLimits(repoID: String) -> Self {
++        let limits = GGUFContextSettingsStore.limits(for: repoID)
++        let trained = GGUFContextSettingsStore.trainedContext(for: repoID) ?? 0
++        let kvBytes = GGUFContextSettingsStore.kvElementsPerToken(for: repoID).map {
++            GGUFMemoryEstimate.kvBytes(elementsPerToken: $0, context: limits.context)
++        } ?? estimatedKVCacheBytes
++        return .init(
++            family: family,
++            modelContextLength: max(trained, limits.context),
++            configuredContextLength: limits.context,
++            maximumKVCacheTokens: limits.context,
++            maximumOutputTokens: limits.output,
++            kvBits: kvBits,
++            prefillStepSize: prefillStepSize,
++            toolParser: toolParser,
++            reasoningParser: reasoningParser,
++            parallelTools: parallelTools,
++            supportsThinkingToggle: supportsThinkingToggle,
++            usesChatTemplateOverride: usesChatTemplateOverride,
++            requiresYaRNContextExtension: requiresYaRNContextExtension,
++            estimatedKVCacheBytes: kvBytes,
++            defaultOutputOverride: limits.output
++        )
+     }
+ 
+     static func resolve(
 diff --git a/IOSLocalLLM/Services/CodingAssistantService.swift b/IOSLocalLLM/Services/CodingAssistantService.swift
-index 1aebf9c..b0e41f4 100644
+index 1aebf9c..b6e3c13 100644
 --- a/IOSLocalLLM/Services/CodingAssistantService.swift
 +++ b/IOSLocalLLM/Services/CodingAssistantService.swift
-@@ -1607,13 +1607,23 @@ final class CodingAssistantService: ObservableObject {
+@@ -263,11 +263,19 @@ final class CodingAssistantService: ObservableObject {
+     }
+ 
+     private static func importedGGUFInputBudget(repoID: String) -> Int {
+-        let context = Int(importedGGUFContextTokens(repoID: repoID))
+-        let output = importedGGUFMaxOutputTokens(repoID: repoID)
++        let (context, output) = importedGGUFLimits(repoID: repoID)
+         return max(320, context - output - 256)
+     }
+ 
++    /// Context / max output for an imported GGUF: the Models-screen setting
++    /// when it applies (everything but Gemma 4), else the fixed profile.
++    private static func importedGGUFLimits(repoID: String) -> (context: Int, output: Int) {
++        if GGUFContextSettingsStore.applies(to: repoID) {
++            return GGUFContextSettingsStore.limits(for: repoID)
++        }
++        return (Int(importedGGUFContextTokens(repoID: repoID)), importedGGUFMaxOutputTokens(repoID: repoID))
++    }
++
+     @Published private(set) var state: ServiceState = .unloaded
+     @Published private(set) var tokenRate: Double = 0
+     /// Estimated token count of the trimmed input sent on the last generate().
+@@ -331,7 +339,7 @@ final class CodingAssistantService: ObservableObject {
+             return max(
+                 1,
+                 min(
+-                    Self.importedGGUFMaxOutputTokens(repoID: activeModel.repoID),
++                    Self.importedGGUFLimits(repoID: activeModel.repoID).output,
+                     DeviceSafetyMonitor.shared.recommendedMaxTokens
+                 )
+             )
+@@ -1576,7 +1584,15 @@ final class CodingAssistantService: ObservableObject {
+                 // Gemma 4 keeps its proven 512-token recurrent profile; Qwen /
+                 // Qwopus and other imported GGUFs receive the bounded 4K VLM
+                 // profile so image prompts and tool schemas are not truncated.
+-                let context = Self.importedGGUFContextTokens(repoID: activeModel.repoID)
++                // Other imported GGUFs use the context chosen on the Models
++                // screen (default 32K, capped at the trained context read
++                // from the GGUF header).
++                let usesContextSettings = GGUFContextSettingsStore.applies(to: activeModel.repoID)
++                let shape = usesContextSettings ? GGUFModelShape.read(path: modelURL.path) : nil
++                if let shape { GGUFContextSettingsStore.remember(shape, for: activeModel.repoID) }
++                let context = usesContextSettings
++                    ? UInt32(GGUFContextSettingsStore.limits(for: activeModel.repoID).context)
++                    : Self.importedGGUFContextTokens(repoID: activeModel.repoID)
+                 let projectorURL = LocalModelFileValidator.ggufProjector(in: directory)
+                 let modelBytes = ((try? FileManager.default.attributesOfItem(atPath: modelURL.path))?[.size] as? NSNumber)?.int64Value ?? 0
+                 let projectorBytes = projectorURL.flatMap {
+@@ -1607,13 +1623,35 @@ final class CodingAssistantService: ObservableObject {
                      "GGUF assistant load · bytes=\(fileBytes) · multimodal=\(projectorURL != nil) · context=\(context) · available=\(available) · gpuLayers=\(gpuLayers) · storageBacked=\(loadPolicy.storageBacked)",
                      category: "assistant"
                  )
++                if let shape, GGUFMemoryEstimate.likelyExceeds(shape, context: Int(context)) {
++                    let needed = GGUFMemoryEstimate.totalBytes(shape, context: Int(context))
++                    Diagnostics.shared.breadcrumb(
++                        "GGUF context may exceed memory · context=\(context) · needed=\(needed) · available=\(GGUFMemoryEstimate.availableBytes)",
++                        category: "assistant"
++                    )
++                    ToastCenter.shared.info(
++                        "Context may be too large",
++                        detail: "About \(needed.formattedBytes) needed, \(GGUFMemoryEstimate.availableBytes.formattedBytes) available. Lower the context on the Models screen if the app closes."
++                    )
++                }
 +                // Optional user-chosen LoRA adapter, applied at scale 1.0.
 +                let loraPath = GGUFLoRAAdapterStore.activeAdapterPath()
 +                if let loraPath {
@@ -108,10 +309,230 @@ index 1aebf9c..b0e41f4 100644
 -                        gpuLayers: gpuLayers
 +                        gpuLayers: gpuLayers,
 +                        loraPath: loraPath,
-+                        loraScale: 1.0
++                        loraScale: 1.0,
++                        optimizedKVCache: usesContextSettings
                      )
                  }.value
                  if Task.isCancelled {
+@@ -1635,6 +1673,9 @@ final class CodingAssistantService: ObservableObject {
+                 ggufModel = loaded
+                 loadedRuntime = nil
+                 ggufVisionProjectorPath = projectorURL?.path
++                GGUFContextSettingsStore.shared.residentBytes = shape.map {
++                    GGUFMemoryEstimate.totalBytes($0, context: Int(context))
++                } ?? fileBytes
+                 Diagnostics.shared.breadcrumb(
+                     "GGUF assistant loaded · footprint=\(MemoryAdvisor.physFootprint) · headroom=\(MemoryAdvisor.availableMemoryForModel) · gpuLayers=\(gpuLayers)",
+                     category: "assistant"
+@@ -2470,9 +2511,13 @@ final class CodingAssistantService: ObservableObject {
+                 ?? s.assistantMaxTokens,
+             safety.recommendedMaxTokens
+         )
+-        let safeMaxTokens = executionProfile.maxOutputTokens.map {
+-            min(requestedMaxTokens, $0)
+-        } ?? requestedMaxTokens
++        // Imported GGUFs are capped by their Models-screen max output below
++        // (importedGGUFLimits), not by the MLX family profile.
++        let usesGGUFContextSettings = activeModel.runtime == .llamaCpp
++            && GGUFContextSettingsStore.applies(to: activeModel.repoID)
++        let safeMaxTokens = usesGGUFContextSettings
++            ? requestedMaxTokens
++            : executionProfile.maxOutputTokens.map { min(requestedMaxTokens, $0) } ?? requestedMaxTokens
+ 
+         // --- Full Sampler Control (Feature #1) ---
+         // Resolution order: per-call samplerConfig > per-call overrides >
+@@ -2665,7 +2710,7 @@ final class CodingAssistantService: ObservableObject {
+             let loggedFirstToken = OSAllocatedUnfairLock(initialState: false)
+             let ggufMaxTokens = min(
+                 safeMaxTokens,
+-                Self.importedGGUFMaxOutputTokens(repoID: activeModel.repoID)
++                Self.importedGGUFLimits(repoID: activeModel.repoID).output
+             )
+             let ggufPrompt: String = {
+                 if let manualPrompt, !manualPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+@@ -3715,6 +3760,7 @@ final class CodingAssistantService: ObservableObject {
+         let ggufRelease = GGUFRuntimeReleaseBox(ggufModel)
+         ggufModel = nil
+         ggufVisionProjectorPath = nil
++        GGUFContextSettingsStore.shared.residentBytes = 0
+         let mlxRelease = MLXContainerReleaseBox(container)
+         container = nil
+         Diagnostics.shared.breadcrumb(
+diff --git a/IOSLocalLLM/Services/LlamaCpp/GGUFContextSettings.swift b/IOSLocalLLM/Services/LlamaCpp/GGUFContextSettings.swift
+new file mode 100644
+index 0000000..e878610
+--- /dev/null
++++ b/IOSLocalLLM/Services/LlamaCpp/GGUFContextSettings.swift
+@@ -0,0 +1,169 @@
++import Foundation
++import Combine
++
++// Per-model context length and max output for imported GGUF models, plus a
++// rough memory estimate (weights + KV cache) to warn before a load that iOS
++// would likely kill.
++
++/// Shape of a GGUF read from its header (no weights are loaded).
++struct GGUFModelShape: Equatable, Sendable {
++    let fileBytes: Int64
++    /// Context length the model was trained for (0 = unknown).
++    let trainedContext: Int
++    /// KV-cache elements stored per token, over every layer that keeps one.
++    let kvElementsPerToken: Int
++
++    static func read(path: String) -> GGUFModelShape? {
++        guard let ctx = gguf_init_from_file(path, gguf_init_params(no_alloc: true, ctx: nil)) else {
++            return nil
++        }
++        defer { gguf_free(ctx) }
++
++        func int(_ key: String) -> Int? {
++            let id = gguf_find_key(ctx, key)
++            guard id >= 0 else { return nil }
++            switch gguf_get_kv_type(ctx, id) {
++            case GGUF_TYPE_UINT32: return Int(gguf_get_val_u32(ctx, id))
++            case GGUF_TYPE_INT32: return Int(gguf_get_val_i32(ctx, id))
++            case GGUF_TYPE_UINT64: return Int(clamping: gguf_get_val_u64(ctx, id))
++            case GGUF_TYPE_ARRAY:
++                // Per-layer values (e.g. head_count_kv): use the largest.
++                let type = gguf_get_arr_type(ctx, id)
++                guard type == GGUF_TYPE_UINT32 || type == GGUF_TYPE_INT32,
++                      let data = gguf_get_arr_data(ctx, id) else { return nil }
++                let values = UnsafeBufferPointer(
++                    start: data.assumingMemoryBound(to: Int32.self),
++                    count: gguf_get_arr_n(ctx, id)
++                )
++                return values.map { Int($0) }.max()
++            default: return nil
++            }
++        }
++
++        let archID = gguf_find_key(ctx, "general.architecture")
++        guard archID >= 0, let archName = gguf_get_val_str(ctx, archID) else { return nil }
++        let arch = String(cString: archName)
++        let layers = int("\(arch).block_count") ?? 0
++        let heads = int("\(arch).attention.head_count") ?? 0
++        let headsKV = int("\(arch).attention.head_count_kv") ?? heads
++        let headDim = heads > 0 ? (int("\(arch).embedding_length") ?? 0) / heads : 0
++        let keyLength = int("\(arch).attention.key_length") ?? headDim
++        let valueLength = int("\(arch).attention.value_length") ?? headDim
++        // Hybrid models (Qwen 3.5, Ternary Bonsai 2) keep a KV cache only on
++        // every Nth layer; the others hold a small fixed recurrent state.
++        let interval = max(1, int("\(arch).full_attention_interval") ?? 1)
++        let attentionLayers = layers / interval
++
++        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
++        let fileBytes = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
++        return GGUFModelShape(
++            fileBytes: fileBytes,
++            trainedContext: int("\(arch).context_length") ?? 0,
++            kvElementsPerToken: attentionLayers * headsKV * (keyLength + valueLength)
++        )
++    }
++}
++
++enum GGUFMemoryEstimate {
++    /// Recurrent state, compute buffers and runtime overhead (rough).
++    static let runtimeOverhead: Int64 = 450_000_000
++    /// Headroom kept free so iOS does not kill the app at the limit.
++    static let safetyMargin: Int64 = 600_000_000
++
++    /// KV cache bytes for `context` tokens; q8_0 stores 32 values in 34 bytes.
++    static func kvBytes(elementsPerToken: Int, context: Int, quantized: Bool = true) -> Int64 {
++        let bytesPerElement = quantized ? 34.0 / 32.0 : 2.0
++        return Int64(Double(elementsPerToken) * Double(context) * bytesPerElement)
++    }
++
++    /// Weights + KV cache + overhead for one loaded model.
++    static func totalBytes(_ shape: GGUFModelShape, context: Int) -> Int64 {
++        shape.fileBytes
++            + kvBytes(elementsPerToken: shape.kvElementsPerToken, context: context)
++            + runtimeOverhead
++    }
++
++    /// Memory a (re)load could use: what the process may still allocate
++    /// (os_proc_available_memory) plus what the currently loaded GGUF holds,
++    /// since a reload frees it first.
++    static var availableBytes: Int64 {
++        MemoryAdvisor.processAvailableMemory + GGUFContextSettingsStore.shared.residentBytes
++    }
++
++    static func likelyExceeds(_ shape: GGUFModelShape, context: Int) -> Bool {
++        let available = availableBytes
++        return available > 0 && totalBytes(shape, context: context) + safetyMargin > available
++    }
++}
++
++/// Saved context length / max output per imported GGUF model. Reads are safe
++/// from any thread (UserDefaults); writes happen from the UI.
++final class GGUFContextSettingsStore: ObservableObject {
++    static let shared = GGUFContextSettingsStore()
++
++    static let contextChoices = [4_096, 8_192, 16_384, 32_768, 65_536]
++    /// The app's thermal guard caps replies near 4096 on current iPhones.
++    static let outputChoices = [1_024, 2_048, 4_096]
++    static let defaultContext = 32_768
++    static let defaultOutput = 4_096
++
++    private static let contextKey = "ggufContext.contextByModel"
++    private static let outputKey = "ggufContext.outputByModel"
++    private static let trainedKey = "ggufContext.trainedContextByModel"
++    private static let kvKey = "ggufContext.kvElementsByModel"
++
++    /// Estimated bytes held by the loaded GGUF runtime (0 when none).
++    @Published var residentBytes: Int64 = 0
++
++    private init() {}
++
++    /// Gemma 4 keeps its own small recurrent profile; every other imported
++    /// GGUF uses these settings.
++    static func applies(to repoID: String) -> Bool {
++        let id = repoID.lowercased()
++        return !(id.contains("gemma-4") || id.contains("gemma4"))
++    }
++
++    private static func value(_ key: String, _ repoID: String) -> Int? {
++        UserDefaults.standard.dictionary(forKey: key)?[repoID] as? Int
++    }
++
++    private static func store(_ value: Int, _ key: String, _ repoID: String) {
++        var map = UserDefaults.standard.dictionary(forKey: key) ?? [:]
++        map[repoID] = value
++        UserDefaults.standard.set(map, forKey: key)
++    }
++
++    /// Context the model was trained for, once its header has been read.
++    static func trainedContext(for repoID: String) -> Int? { value(trainedKey, repoID) }
++
++    static func kvElementsPerToken(for repoID: String) -> Int? { value(kvKey, repoID) }
++
++    /// Largest max output for a context: a quarter of it, the same reserve
++    /// LlamaCppVLM.generateText keeps for the reply.
++    static func maximumOutput(forContext context: Int) -> Int { max(256, context / 4) }
++
++    /// Effective limits: saved choice (or 32K / 4096), capped at the trained
++    /// context; output capped at a quarter of the context.
++    static func limits(for repoID: String) -> (context: Int, output: Int) {
++        var context = value(contextKey, repoID) ?? defaultContext
++        if let trained = trainedContext(for: repoID), trained > 0 {
++            context = min(context, trained)
++        }
++        let output = min(value(outputKey, repoID) ?? defaultOutput, maximumOutput(forContext: context))
++        return (context, output)
++    }
++
++    func set(context: Int, output: Int, for repoID: String) {
++        objectWillChange.send()
++        Self.store(context, Self.contextKey, repoID)
++        Self.store(output, Self.outputKey, repoID)
++    }
++
++    /// Caches header facts so limits and the API profile can use them
++    /// without re-reading the file.
++    static func remember(_ shape: GGUFModelShape, for repoID: String) {
++        if shape.trainedContext > 0 { store(shape.trainedContext, trainedKey, repoID) }
++        if shape.kvElementsPerToken > 0 { store(shape.kvElementsPerToken, kvKey, repoID) }
++    }
++}
 diff --git a/IOSLocalLLM/Services/LlamaCpp/GGUFLoRAAdapterStore.swift b/IOSLocalLLM/Services/LlamaCpp/GGUFLoRAAdapterStore.swift
 new file mode 100644
 index 0000000..960bc0b
@@ -174,8 +595,21 @@ index 0000000..960bc0b
 +        fileName = nil
 +    }
 +}
+diff --git a/IOSLocalLLM/Services/LlamaCpp/IOSLocalLLM-Bridging-Header.h b/IOSLocalLLM/Services/LlamaCpp/IOSLocalLLM-Bridging-Header.h
+index c39b9ce..231372b 100644
+--- a/IOSLocalLLM/Services/LlamaCpp/IOSLocalLLM-Bridging-Header.h
++++ b/IOSLocalLLM/Services/LlamaCpp/IOSLocalLLM-Bridging-Header.h
+@@ -44,4 +44,8 @@
+ // decode in one call.
+ #import "mtmd-helper.h"
+ 
++// gguf — header-only reads of imported models (context length, KV shape)
++// for the context settings, without loading weights.
++#import "gguf.h"
++
+ #endif  // IOS_LOCAL_LLM_BRIDGING_HEADER_H
 diff --git a/IOSLocalLLM/Services/LlamaCpp/LlamaCppBridge.swift b/IOSLocalLLM/Services/LlamaCpp/LlamaCppBridge.swift
-index db485dc..6781ab2 100644
+index db485dc..1cac767 100644
 --- a/IOSLocalLLM/Services/LlamaCpp/LlamaCppBridge.swift
 +++ b/IOSLocalLLM/Services/LlamaCpp/LlamaCppBridge.swift
 @@ -51,6 +51,7 @@ enum LlamaCppError: Error, LocalizedError {
@@ -202,7 +636,7 @@ index db485dc..6781ab2 100644
          case (.tokenizeFailed(let a), .tokenizeFailed(let b)):       return a == b
          case (.invalidToken(let a), .invalidToken(let b)):           return a == b
          case (.decodeFailed(let a), .decodeFailed(let b)):           return a == b
-@@ -120,6 +123,11 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -120,8 +123,16 @@ final class LlamaCppVLM: @unchecked Sendable {
      // not `OpaquePointer`. Same applies to llama_batch (handled
      // inline in describe).
      private var sampler: UnsafeMutablePointer<llama_sampler>?
@@ -213,8 +647,13 @@ index db485dc..6781ab2 100644
 +    private let loraScale: Float
      private let configuredThreads: Int32
      private let configuredContextSize: UInt32
++    /// Flash attention + q8_0 KV cache (about half the KV memory of f16).
++    /// Cleared if llama.cpp rejects it, so later contexts use the defaults.
++    private var useOptimizedKV: Bool
      private let textGenerationActive = OSAllocatedUnfairLock(initialState: false)
-@@ -137,9 +145,20 @@ final class LlamaCppVLM: @unchecked Sendable {
+ 
+     // MARK: - Cancellation
+@@ -137,9 +148,20 @@ final class LlamaCppVLM: @unchecked Sendable {
      private static var backendInitDone = false
      private static let backendInitLock = NSLock()
  
@@ -235,22 +674,24 @@ index db485dc..6781ab2 100644
              llama_backend_init()
              backendInitDone = true
          }
-@@ -156,10 +175,13 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -156,10 +178,15 @@ final class LlamaCppVLM: @unchecked Sendable {
          mmprojPath: String? = nil,
          nThreads: Int32 = Int32(ProcessInfo.processInfo.activeProcessorCount),
          contextSize: UInt32 = 4096,
 -        gpuLayers: Int32 = 999
 +        gpuLayers: Int32 = 999,
 +        loraPath: String? = nil,
-+        loraScale: Float = 1.0
++        loraScale: Float = 1.0,
++        optimizedKVCache: Bool = false
      ) throws {
          self.configuredThreads = nThreads
          self.configuredContextSize = contextSize
 +        self.loraScale = loraScale
++        self.useOptimizedKV = optimizedKVCache
          Self.ensureBackendInit()
  
          // 1. Load the text LLM. Default params enable mmap on iOS
-@@ -173,6 +195,21 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -173,22 +200,39 @@ final class LlamaCppVLM: @unchecked Sendable {
          }
          self.model = m
  
@@ -272,9 +713,15 @@ index db485dc..6781ab2 100644
          // 2. Create the inference context. n_batch is the max
          //    tokens per llama_decode call; image embeddings can
          //    arrive in larger batches than typical text, so we
-@@ -185,10 +222,18 @@ final class LlamaCppVLM: @unchecked Sendable {
-         ctxParams.n_threads_batch = nThreads
-         guard let c = llama_init_from_model(m, ctxParams) else {
+         //    bump above the 32-token default.
+-        var ctxParams = llama_context_default_params()
+-        ctxParams.n_ctx = contextSize
+-        ctxParams.n_batch = 512
+-        ctxParams.n_ubatch = 512
+-        ctxParams.n_threads = nThreads
+-        ctxParams.n_threads_batch = nThreads
+-        guard let c = llama_init_from_model(m, ctxParams) else {
++        guard let c = makeContext(m, batchSize: 512) else {
              llama_model_free(m)
 -            self.model = nil
 +            self.model = nil; self.loraAdapter = nil
@@ -292,7 +739,7 @@ index db485dc..6781ab2 100644
  
          // A standalone text GGUF is complete without an mmproj. Keep the
          // llama context and build the normal sampler, then return before the
-@@ -216,7 +261,7 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -216,7 +260,7 @@ final class LlamaCppVLM: @unchecked Sendable {
          guard let mc = mtmd_init_from_file(mmprojPath, m, mtmdParams) else {
              llama_free(c)
              llama_model_free(m)
@@ -301,7 +748,7 @@ index db485dc..6781ab2 100644
              throw LlamaCppError.mmprojLoadFailed(mmprojPath)
          }
          self.mtmdCtx = mc
-@@ -229,7 +274,7 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -229,7 +273,7 @@ final class LlamaCppVLM: @unchecked Sendable {
              mtmd_free(mc)
              llama_free(c)
              llama_model_free(m)
@@ -310,7 +757,7 @@ index db485dc..6781ab2 100644
              throw LlamaCppError.visionUnsupported
          }
  
-@@ -254,19 +299,33 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -254,19 +298,60 @@ final class LlamaCppVLM: @unchecked Sendable {
          if let s = sampler { llama_sampler_free(s) }
          if let mc = mtmdCtx { mtmd_free(mc) }
          if let c = ctx { llama_free(c) }
@@ -319,6 +766,33 @@ index db485dc..6781ab2 100644
          if let m = model { llama_model_free(m) }
      }
  
++    /// Creates a context with this runtime's settings. Used for the first
++    /// context and for the fresh one each text request makes, so both get
++    /// the same context size and KV-cache type.
++    private func makeContext(_ model: OpaquePointer, batchSize: UInt32) -> OpaquePointer? {
++        var params = llama_context_default_params()
++        params.n_ctx = configuredContextSize
++        params.n_batch = batchSize
++        params.n_ubatch = batchSize
++        params.n_threads = configuredThreads
++        params.n_threads_batch = configuredThreads
++        if useOptimizedKV {
++            var optimized = params
++            optimized.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED
++            optimized.type_k = GGML_TYPE_Q8_0
++            optimized.type_v = GGML_TYPE_Q8_0
++            if let context = llama_init_from_model(model, optimized) { return context }
++            // Not supported for this model/backend: use the f16 defaults now
++            // and for every later context.
++            useOptimizedKV = false
++            Diagnostics.shared.breadcrumb(
++                "GGUF flash attention / q8_0 KV cache rejected; using defaults",
++                category: "assistant"
++            )
++        }
++        return llama_init_from_model(model, params)
++    }
++
 +    /// Applies the LoRA adapter (if one was loaded) to a new context.
 +    /// Returns false when llama.cpp rejects it.
 +    private func applyLoRA(to context: OpaquePointer) -> Bool {
@@ -346,7 +820,7 @@ index db485dc..6781ab2 100644
              )
          }
          if spec.topK > 0 {
-@@ -318,7 +377,8 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -318,7 +403,8 @@ final class LlamaCppVLM: @unchecked Sendable {
          let ownedSampler: UnsafeMutablePointer<llama_sampler>?
          let samp: UnsafeMutablePointer<llama_sampler>
          if let samplerSpec {
@@ -356,7 +830,18 @@ index db485dc..6781ab2 100644
                  throw LlamaCppError.contextInitFailed
              }
              ownedSampler = created
-@@ -417,6 +477,7 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -407,16 +493,11 @@ final class LlamaCppVLM: @unchecked Sendable {
+             llama_free(oldContext)
+             ctx = nil
+         }
+-        var requestParams = llama_context_default_params()
+-        requestParams.n_ctx = configuredContextSize
+-        requestParams.n_batch = UInt32(physicalBatchSize)
+-        requestParams.n_ubatch = UInt32(physicalBatchSize)
+-        requestParams.n_threads = configuredThreads
+-        requestParams.n_threads_batch = configuredThreads
+-        guard let c = llama_init_from_model(m, requestParams) else {
++        guard let c = makeContext(m, batchSize: UInt32(physicalBatchSize)) else {
              throw LlamaCppError.contextInitFailed
          }
          ctx = c
