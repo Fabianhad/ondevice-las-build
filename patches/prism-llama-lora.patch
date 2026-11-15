@@ -1,0 +1,323 @@
+diff --git a/IOSLocalLLM/ModelDownloadsView.swift b/IOSLocalLLM/ModelDownloadsView.swift
+index 6c012d2..d710869 100644
+--- a/IOSLocalLLM/ModelDownloadsView.swift
++++ b/IOSLocalLLM/ModelDownloadsView.swift
+@@ -58,6 +58,7 @@ struct LASModelDownloadsView: View {
+                     } else {
+                         headerCard
+                         memoryCard
++                        LASLoRAAdapterCard(onChoose: chooseLoRAAdapter)
+ 
+                     if models.isEmpty {
+                         ContentUnavailableView(
+@@ -307,6 +308,17 @@ struct LASModelDownloadsView: View {
+         )
+     }
+ 
++    private func chooseLoRAAdapter() {
++        importError = nil
++        LocalModelDocumentPickerSession.shared.present(kind: .file, onPick: { url in
++            do {
++                try GGUFLoRAAdapterStore.shared.importAdapter(from: url)
++            } catch {
++                importError = error.localizedDescription
++            }
++        })
++    }
++
+     private func importModel(at url: URL) async {
+         isImportingModel = true
+         importStatus = "Importing \(url.deletingPathExtension().lastPathComponent)…"
+@@ -588,6 +600,35 @@ private struct LASModelLibraryCard: View {
+     }
+ }
+ 
++/// Picks or clears the llama.cpp LoRA adapter applied to imported GGUF models.
++private struct LASLoRAAdapterCard: View {
++    @ObservedObject private var store = GGUFLoRAAdapterStore.shared
++    let onChoose: () -> Void
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: LASDesignTokens.row) {
++            LASSectionLabel(title: "LORA ADAPTER", trailing: store.fileName == nil ? "OFF" : "SCALE 1.0")
++            Text(verbatim: store.fileName ?? "No adapter")
++                .font(.subheadline.monospaced())
++                .lineLimit(1)
++                .truncationMode(.middle)
++            Text("Applied to imported GGUF models the next time one loads. It must match the base model: the Ternary Bonsai uncensored adapter was only tested with the PTQ1_0 file.")
++                .font(.caption)
++                .foregroundStyle(.secondary)
++            HStack(spacing: LASDesignTokens.tight) {
++                Button(store.fileName == nil ? "Choose adapter file" : "Replace", action: onChoose)
++                    .buttonStyle(LASModelPrimaryActionStyle())
++                if store.fileName != nil {
++                    Button("Clear") { store.clear() }
++                        .buttonStyle(LASModelSecondaryActionStyle(foreground: .red))
++                }
++            }
++        }
++        .frame(maxWidth: .infinity, alignment: .leading)
++        .lasCard(radius: 22, padding: LASDesignTokens.component)
++    }
++}
++
+ private struct LASModelsCapacityStrip: View {
+     let thermal: String
+     let thermalColor: Color
+diff --git a/IOSLocalLLM/Services/CodingAssistantService.swift b/IOSLocalLLM/Services/CodingAssistantService.swift
+index 1aebf9c..b0e41f4 100644
+--- a/IOSLocalLLM/Services/CodingAssistantService.swift
++++ b/IOSLocalLLM/Services/CodingAssistantService.swift
+@@ -1607,13 +1607,23 @@ final class CodingAssistantService: ObservableObject {
+                     "GGUF assistant load · bytes=\(fileBytes) · multimodal=\(projectorURL != nil) · context=\(context) · available=\(available) · gpuLayers=\(gpuLayers) · storageBacked=\(loadPolicy.storageBacked)",
+                     category: "assistant"
+                 )
++                // Optional user-chosen LoRA adapter, applied at scale 1.0.
++                let loraPath = GGUFLoRAAdapterStore.activeAdapterPath()
++                if let loraPath {
++                    Diagnostics.shared.breadcrumb(
++                        "GGUF LoRA adapter · \((loraPath as NSString).lastPathComponent) · scale=1.0",
++                        category: "assistant"
++                    )
++                }
+                 var loadedRuntime: LlamaCppVLM? = try await Task.detached(priority: .userInitiated) {
+                     try LlamaCppVLM(
+                         llmPath: modelURL.path,
+                         mmprojPath: projectorURL?.path,
+                         nThreads: 4,
+                         contextSize: context,
+-                        gpuLayers: gpuLayers
++                        gpuLayers: gpuLayers,
++                        loraPath: loraPath,
++                        loraScale: 1.0
+                     )
+                 }.value
+                 if Task.isCancelled {
+diff --git a/IOSLocalLLM/Services/LlamaCpp/GGUFLoRAAdapterStore.swift b/IOSLocalLLM/Services/LlamaCpp/GGUFLoRAAdapterStore.swift
+new file mode 100644
+index 0000000..960bc0b
+--- /dev/null
++++ b/IOSLocalLLM/Services/LlamaCpp/GGUFLoRAAdapterStore.swift
+@@ -0,0 +1,56 @@
++import Foundation
++import Combine
++
++/// The one llama.cpp LoRA adapter (.gguf) applied to imported GGUF models.
++///
++/// The picked file is copied into Application Support so it outlives the
++/// picker's temporary copy. Only one adapter is kept: choosing a new one
++/// replaces it. Changes take effect the next time a GGUF model loads.
++final class GGUFLoRAAdapterStore: ObservableObject {
++    static let shared = GGUFLoRAAdapterStore()
++
++    private static let fileNameKey = "ggufLoRA.adapterFileName"
++
++    /// File name of the active adapter, or nil when none is set.
++    @Published private(set) var fileName: String?
++
++    private init() {
++        fileName = Self.activeAdapterPath().map { ($0 as NSString).lastPathComponent }
++    }
++
++    static var directory: URL {
++        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
++            .appendingPathComponent("GGUFLoRA", isDirectory: true)
++    }
++
++    /// Absolute path of the active adapter, or nil when none is set or the
++    /// file is gone. Read by the GGUF loader.
++    static func activeAdapterPath() -> String? {
++        guard let name = UserDefaults.standard.string(forKey: fileNameKey) else { return nil }
++        let path = directory.appendingPathComponent(name).path
++        return FileManager.default.fileExists(atPath: path) ? path : nil
++    }
++
++    /// Copies a picked adapter into the app and makes it the active one.
++    func importAdapter(from url: URL) throws {
++        guard url.pathExtension.lowercased() == "gguf" else {
++            throw CocoaError(.fileReadUnsupportedScheme, userInfo: [
++                NSLocalizedDescriptionKey: "Choose a LoRA adapter in GGUF format (.gguf)."
++            ])
++        }
++        let manager = FileManager.default
++        clear()
++        try manager.createDirectory(at: Self.directory, withIntermediateDirectories: true)
++        let destination = Self.directory.appendingPathComponent(url.lastPathComponent)
++        try manager.copyItem(at: url, to: destination)
++        UserDefaults.standard.set(destination.lastPathComponent, forKey: Self.fileNameKey)
++        fileName = destination.lastPathComponent
++    }
++
++    /// Removes the adapter so models load without one.
++    func clear() {
++        try? FileManager.default.removeItem(at: Self.directory)
++        UserDefaults.standard.removeObject(forKey: Self.fileNameKey)
++        fileName = nil
++    }
++}
+diff --git a/IOSLocalLLM/Services/LlamaCpp/LlamaCppBridge.swift b/IOSLocalLLM/Services/LlamaCpp/LlamaCppBridge.swift
+index db485dc..23805b6 100644
+--- a/IOSLocalLLM/Services/LlamaCpp/LlamaCppBridge.swift
++++ b/IOSLocalLLM/Services/LlamaCpp/LlamaCppBridge.swift
+@@ -51,6 +51,7 @@ enum LlamaCppError: Error, LocalizedError {
+     case backendInitFailed
+     case modelLoadFailed(String)
+     case mmprojLoadFailed(String)
++    case loraLoadFailed(String)
+     case contextInitFailed
+     case tokenizeFailed(Int32)
+     case invalidToken(Int32)
+@@ -67,6 +68,7 @@ enum LlamaCppError: Error, LocalizedError {
+         case .backendInitFailed:           return "llama.cpp backend init failed"
+         case .modelLoadFailed(let p):      return "Failed to load LLM at \(p)"
+         case .mmprojLoadFailed(let p):     return "Failed to load mmproj at \(p)"
++        case .loraLoadFailed(let p):       return "Failed to apply LoRA adapter \(p) (is it built for this base model?)"
+         case .contextInitFailed:           return "Failed to create llama context"
+         case .tokenizeFailed(let code):    return "mtmd_tokenize failed with code \(code)"
+         case .invalidToken(let token):     return "Tokenizer produced invalid token id \(token)"
+@@ -98,6 +100,7 @@ extension LlamaCppError: Equatable {
+             return true
+         case (.modelLoadFailed(let a), .modelLoadFailed(let b)):     return a == b
+         case (.mmprojLoadFailed(let a), .mmprojLoadFailed(let b)):   return a == b
++        case (.loraLoadFailed(let a), .loraLoadFailed(let b)):       return a == b
+         case (.tokenizeFailed(let a), .tokenizeFailed(let b)):       return a == b
+         case (.invalidToken(let a), .invalidToken(let b)):           return a == b
+         case (.decodeFailed(let a), .decodeFailed(let b)):           return a == b
+@@ -120,6 +123,11 @@ final class LlamaCppVLM: @unchecked Sendable {
+     // not `OpaquePointer`. Same applies to llama_batch (handled
+     // inline in describe).
+     private var sampler: UnsafeMutablePointer<llama_sampler>?
++    // Optional llama.cpp LoRA adapter (llama_adapter_lora *). It belongs to
++    // the model, but contexts start without adapters, so it is re-applied to
++    // every context this class creates (see applyLoRA).
++    private var loraAdapter: OpaquePointer?
++    private let loraScale: Float
+     private let configuredThreads: Int32
+     private let configuredContextSize: UInt32
+     private let textGenerationActive = OSAllocatedUnfairLock(initialState: false)
+@@ -156,10 +164,13 @@ final class LlamaCppVLM: @unchecked Sendable {
+         mmprojPath: String? = nil,
+         nThreads: Int32 = Int32(ProcessInfo.processInfo.activeProcessorCount),
+         contextSize: UInt32 = 4096,
+-        gpuLayers: Int32 = 999
++        gpuLayers: Int32 = 999,
++        loraPath: String? = nil,
++        loraScale: Float = 1.0
+     ) throws {
+         self.configuredThreads = nThreads
+         self.configuredContextSize = contextSize
++        self.loraScale = loraScale
+         Self.ensureBackendInit()
+ 
+         // 1. Load the text LLM. Default params enable mmap on iOS
+@@ -173,6 +184,18 @@ final class LlamaCppVLM: @unchecked Sendable {
+         }
+         self.model = m
+ 
++        // 1b. Optional LoRA adapter. llama.cpp frees adapters together with
++        //     their model, so the failure paths below that free the model
++        //     only clear this handle (deinit would otherwise free it twice).
++        if let loraPath {
++            guard let adapter = llama_adapter_lora_init(m, loraPath) else {
++                llama_model_free(m)
++                self.model = nil
++                throw LlamaCppError.loraLoadFailed((loraPath as NSString).lastPathComponent)
++            }
++            self.loraAdapter = adapter
++        }
++
+         // 2. Create the inference context. n_batch is the max
+         //    tokens per llama_decode call; image embeddings can
+         //    arrive in larger batches than typical text, so we
+@@ -185,10 +208,18 @@ final class LlamaCppVLM: @unchecked Sendable {
+         ctxParams.n_threads_batch = nThreads
+         guard let c = llama_init_from_model(m, ctxParams) else {
+             llama_model_free(m)
+-            self.model = nil
++            self.model = nil; self.loraAdapter = nil
+             throw LlamaCppError.contextInitFailed
+         }
+         self.ctx = c
++        guard applyLoRA(to: c) else {
++            llama_free(c)
++            llama_model_free(m)
++            self.ctx = nil; self.model = nil
++            let name = loraPath.map { ($0 as NSString).lastPathComponent } ?? "adapter"
++            self.loraAdapter = nil
++            throw LlamaCppError.loraLoadFailed(name)
++        }
+ 
+         // A standalone text GGUF is complete without an mmproj. Keep the
+         // llama context and build the normal sampler, then return before the
+@@ -216,7 +247,7 @@ final class LlamaCppVLM: @unchecked Sendable {
+         guard let mc = mtmd_init_from_file(mmprojPath, m, mtmdParams) else {
+             llama_free(c)
+             llama_model_free(m)
+-            self.ctx = nil; self.model = nil
++            self.ctx = nil; self.model = nil; self.loraAdapter = nil
+             throw LlamaCppError.mmprojLoadFailed(mmprojPath)
+         }
+         self.mtmdCtx = mc
+@@ -229,7 +260,7 @@ final class LlamaCppVLM: @unchecked Sendable {
+             mtmd_free(mc)
+             llama_free(c)
+             llama_model_free(m)
+-            self.mtmdCtx = nil; self.ctx = nil; self.model = nil
++            self.mtmdCtx = nil; self.ctx = nil; self.model = nil; self.loraAdapter = nil
+             throw LlamaCppError.visionUnsupported
+         }
+ 
+@@ -254,19 +285,33 @@ final class LlamaCppVLM: @unchecked Sendable {
+         if let s = sampler { llama_sampler_free(s) }
+         if let mc = mtmdCtx { mtmd_free(mc) }
+         if let c = ctx { llama_free(c) }
++        // Free the adapter after its last context and before its model.
++        if let a = loraAdapter { llama_adapter_lora_free(a) }
+         if let m = model { llama_model_free(m) }
+     }
+ 
++    /// Applies the LoRA adapter (if one was loaded) to a new context.
++    /// Returns false when llama.cpp rejects it.
++    private func applyLoRA(to context: OpaquePointer) -> Bool {
++        guard let adapter = loraAdapter else { return true }
++        var adapters: [OpaquePointer?] = [adapter]
++        var scales: [Float] = [loraScale]
++        return llama_set_adapters_lora(context, &adapters, 1, &scales) == 0
++    }
++
+     /// Canonical llama.cpp order: penalties -> top-k -> top-p -> temp -> dist.
+     private static func makeSampler(
+-        _ spec: LlamaCppSamplerSpec
++        _ spec: LlamaCppSamplerSpec,
++        vocabularySize: Int32
+     ) -> UnsafeMutablePointer<llama_sampler>? {
+         let params = llama_sampler_chain_default_params()
+         guard let chain = llama_sampler_chain_init(params) else { return nil }
+         if abs(spec.repetitionPenalty - 1) > 0.001 {
++            // The Prism llama.cpp fork's penalties sampler also takes the
++            // vocabulary size (first argument).
+             llama_sampler_chain_add(
+                 chain,
+-                llama_sampler_init_penalties(64, spec.repetitionPenalty, 0, 0)
++                llama_sampler_init_penalties(vocabularySize, 64, spec.repetitionPenalty, 0, 0)
+             )
+         }
+         if spec.topK > 0 {
+@@ -318,7 +363,8 @@ final class LlamaCppVLM: @unchecked Sendable {
+         let ownedSampler: UnsafeMutablePointer<llama_sampler>?
+         let samp: UnsafeMutablePointer<llama_sampler>
+         if let samplerSpec {
+-            guard let created = Self.makeSampler(samplerSpec) else {
++            let vocabularySize = llama_vocab_n_tokens(llama_model_get_vocab(m))
++            guard let created = Self.makeSampler(samplerSpec, vocabularySize: vocabularySize) else {
+                 throw LlamaCppError.contextInitFailed
+             }
+             ownedSampler = created
+@@ -417,6 +463,7 @@ final class LlamaCppVLM: @unchecked Sendable {
+             throw LlamaCppError.contextInitFailed
+         }
+         ctx = c
++        guard applyLoRA(to: c) else { throw LlamaCppError.loraLoadFailed("adapter") }
+ 
+         // Use llama.cpp's single-sequence helper instead of assigning explicit
+         // positions. Qwen 3.5 mixes recurrent/GDN and attention layers; current

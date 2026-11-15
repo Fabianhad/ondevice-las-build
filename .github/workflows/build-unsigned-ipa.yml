@@ -7,6 +7,13 @@ name: Build unsigned IPA (raised token limits)
 #
 # Run it from the Actions tab: "Build unsigned IPA (raised token limits)" >
 # "Run workflow". The .ipa is attached to the run as an artifact.
+#
+# llama_source:
+#   stock - builds the llama.cpp version the app pins, as before.
+#   prism - uses PrismML's llama.cpp fork (needed for Ternary Bonsai models):
+#           its prebuilt release xcframework plus the matching headers, and
+#           applies patches/prism-llama-lora.patch (API fixes for the newer
+#           llama.cpp + a LoRA adapter picker on the Models screen).
 
 on:
   workflow_dispatch:
@@ -23,6 +30,14 @@ on:
         description: "llama.cpp context for imported GGUF models (was 4096). Must exceed max_output_tokens by at least 576. Larger = more RAM"
         default: "16384"
         required: true
+      llama_source:
+        description: "llama.cpp source: stock (the app's pinned version) or prism (PrismML fork, for Ternary Bonsai + LoRA adapters)"
+        type: choice
+        options:
+          - stock
+          - prism
+        default: stock
+        required: true
 
 permissions:
   contents: read
@@ -34,6 +49,10 @@ jobs:
     env:
       MAX_OUTPUT: ${{ inputs.max_output_tokens }}
       CONTEXT: ${{ inputs.context_tokens }}
+      # PrismML fork release used when llama_source = prism. The patch in
+      # patches/ was written against this release's API.
+      PRISM_TAG: prism-b12128-d7b2896
+      PRISM_XCFRAMEWORK_SHA256: f61bc329b9c33ea207e685370de1660115ecbce1c3bfeeb2e2b8534099b31ed0
     steps:
       - name: Validate inputs
         run: |
@@ -52,6 +71,13 @@ jobs:
           repository: Mesutcydev/ios-local-llm
           ref: ${{ inputs.ref }}
           submodules: false
+
+      # After the app checkout, which cleans the workspace.
+      - name: Check out this repo's patches (prism)
+        if: inputs.llama_source == 'prism'
+        uses: actions/checkout@v4
+        with:
+          path: build-support
 
       - name: Select Xcode 26
         run: |
@@ -89,13 +115,14 @@ jobs:
 
       - name: Restore cached llama.xcframework
         id: llama-cache
+        if: inputs.llama_source == 'stock'
         uses: actions/cache@v4
         with:
           path: ThirdParty/llama.cpp/build-apple/llama.xcframework
           key: llama-xcframework-${{ runner.os }}-${{ hashFiles('Patches/llama.cpp-ios-only-xcframework.patch') }}-${{ inputs.ref }}
 
       - name: Build llama.xcframework (pinned llama.cpp + the repo's iOS-only patch)
-        if: steps.llama-cache.outputs.cache-hit != 'true'
+        if: inputs.llama_source == 'stock' && steps.llama-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           # Same steps as scripts/build_native_frameworks.sh, without whisper.cpp
@@ -107,12 +134,45 @@ jobs:
           test -d "$cached"
 
       - name: Fetch llama.cpp headers (cache hit)
-        if: steps.llama-cache.outputs.cache-hit == 'true'
+        if: inputs.llama_source == 'stock' && steps.llama-cache.outputs.cache-hit == 'true'
         run: |
           # The bridging header still needs the pinned llama.cpp headers
           mv ThirdParty/llama.cpp/build-apple /tmp/build-apple
           git submodule update --init ThirdParty/llama.cpp
           mv /tmp/build-apple ThirdParty/llama.cpp/build-apple
+
+      - name: Use the PrismML llama.cpp fork (prebuilt xcframework + headers)
+        if: inputs.llama_source == 'prism'
+        run: |
+          set -euo pipefail
+          # Source tree at the release tag: project.yml's header search paths
+          # (include/, ggml/include/, tools/mtmd/) point here.
+          rm -rf ThirdParty/llama.cpp
+          git clone --quiet --depth 1 --branch "$PRISM_TAG" \
+            https://github.com/PrismML-Eng/llama.cpp ThirdParty/llama.cpp
+          zip=/tmp/llama-prism-xcframework.zip
+          curl -fsSL -o "$zip" \
+            "https://github.com/PrismML-Eng/llama.cpp/releases/download/$PRISM_TAG/llama-$PRISM_TAG-xcframework.zip"
+          echo "$PRISM_XCFRAMEWORK_SHA256  $zip" | shasum -a 256 -c -
+          # The zip holds build-apple/llama.xcframework, the path project.yml links.
+          unzip -q "$zip" -d ThirdParty/llama.cpp
+          fw=ThirdParty/llama.cpp/build-apple/llama.xcframework/ios-arm64/llama.framework
+          test -f "$fw/llama"
+          # The bridging header compiles against the source headers; they must
+          # be the ones the binary was built from.
+          src=ThirdParty/llama.cpp
+          cmp "$fw/Headers/llama.h" "$src/include/llama.h"
+          cmp "$fw/Headers/ggml.h" "$src/ggml/include/ggml.h"
+          cmp "$fw/Headers/mtmd.h" "$src/tools/mtmd/mtmd.h"
+          cmp "$fw/Headers/mtmd-helper.h" "$src/tools/mtmd/mtmd-helper.h"
+          echo "Using $PRISM_TAG"
+
+      - name: Apply the Prism API fixes and LoRA adapter support
+        if: inputs.llama_source == 'prism'
+        run: |
+          set -euo pipefail
+          git apply --verbose build-support/patches/prism-llama-lora.patch
+          rm -rf build-support
 
       - name: Generate the Xcode project
         run: |
@@ -160,7 +220,9 @@ jobs:
             grep -q "$key" entitlements.xml || { echo "::error::$key missing from the signature"; exit 1; }
           done
 
-          name="OnDeviceLAS-${{ inputs.ref }}-out${MAX_OUTPUT}-ctx${CONTEXT}-entitled.ipa"
+          flavor=""
+          [ "${{ inputs.llama_source }}" = prism ] && flavor="-prism"
+          name="OnDeviceLAS-${{ inputs.ref }}-out${MAX_OUTPUT}-ctx${CONTEXT}${flavor}-entitled.ipa"
           zip -qry "$name" Payload
           echo "IPA_NAME=$name" >> "$GITHUB_ENV"
           ls -lh "$name"
