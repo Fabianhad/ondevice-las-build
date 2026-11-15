@@ -64,6 +64,25 @@ index 6c012d2..d710869 100644
  private struct LASModelsCapacityStrip: View {
      let thermal: String
      let thermalColor: Color
+diff --git a/IOSLocalLLM/Models/ChatTemplate.swift b/IOSLocalLLM/Models/ChatTemplate.swift
+index 40973a5..ba48ed4 100644
+--- a/IOSLocalLLM/Models/ChatTemplate.swift
++++ b/IOSLocalLLM/Models/ChatTemplate.swift
+@@ -276,8 +276,13 @@ struct ChatTemplate: Codable, Hashable {
+     /// Detect the best template for a model based on its repo ID or display name.
+     static func detect(for repoID: String) -> ChatTemplate {
+         let lower = repoID.lowercased()
++        // Ternary Bonsai 2 (every size) is Qwen 3.5-based: with plain ChatML
++        // it always opens a long <think> block, which the API strips, so a
++        // cut-off reply comes back empty.
++        let isBonsai2 = lower.contains("bonsai-2") || lower.contains("bonsai_2")
++            || lower.contains("bonsai2")
+         if lower.contains("qwen3.5") || lower.contains("qwen3_5")
+-            || (lower.contains("bonsai") && lower.contains("27b")) {
++            || (lower.contains("bonsai") && (lower.contains("27b") || isBonsai2)) {
+             return .qwen35
+         }
+         if lower.contains("bonsai") { return .chatML }
 diff --git a/IOSLocalLLM/Services/CodingAssistantService.swift b/IOSLocalLLM/Services/CodingAssistantService.swift
 index 1aebf9c..b0e41f4 100644
 --- a/IOSLocalLLM/Services/CodingAssistantService.swift
@@ -156,7 +175,7 @@ index 0000000..960bc0b
 +    }
 +}
 diff --git a/IOSLocalLLM/Services/LlamaCpp/LlamaCppBridge.swift b/IOSLocalLLM/Services/LlamaCpp/LlamaCppBridge.swift
-index db485dc..23805b6 100644
+index db485dc..6781ab2 100644
 --- a/IOSLocalLLM/Services/LlamaCpp/LlamaCppBridge.swift
 +++ b/IOSLocalLLM/Services/LlamaCpp/LlamaCppBridge.swift
 @@ -51,6 +51,7 @@ enum LlamaCppError: Error, LocalizedError {
@@ -171,7 +190,7 @@ index db485dc..23805b6 100644
          case .backendInitFailed:           return "llama.cpp backend init failed"
          case .modelLoadFailed(let p):      return "Failed to load LLM at \(p)"
          case .mmprojLoadFailed(let p):     return "Failed to load mmproj at \(p)"
-+        case .loraLoadFailed(let p):       return "Failed to apply LoRA adapter \(p) (is it built for this base model?)"
++        case .loraLoadFailed(let p):       return "Failed to apply LoRA adapter \(p)"
          case .contextInitFailed:           return "Failed to create llama context"
          case .tokenizeFailed(let code):    return "mtmd_tokenize failed with code \(code)"
          case .invalidToken(let token):     return "Tokenizer produced invalid token id \(token)"
@@ -195,7 +214,28 @@ index db485dc..23805b6 100644
      private let configuredThreads: Int32
      private let configuredContextSize: UInt32
      private let textGenerationActive = OSAllocatedUnfairLock(initialState: false)
-@@ -156,10 +164,13 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -137,9 +145,20 @@ final class LlamaCppVLM: @unchecked Sendable {
+     private static var backendInitDone = false
+     private static let backendInitLock = NSLock()
+ 
++    /// Last error line llama.cpp logged, so a failed LoRA load can say why.
++    private static let lastNativeError = OSAllocatedUnfairLock<String?>(initialState: nil)
++
+     private static func ensureBackendInit() {
+         backendInitLock.lock(); defer { backendInitLock.unlock() }
+         if !backendInitDone {
++            // Keep llama.cpp's stderr output and also remember its last error.
++            llama_log_set({ level, text, _ in
++                guard let text else { return }
++                fputs(text, stderr)
++                guard level == GGML_LOG_LEVEL_ERROR else { return }
++                let line = String(cString: text).trimmingCharacters(in: .whitespacesAndNewlines)
++                if !line.isEmpty { LlamaCppVLM.lastNativeError.withLock { $0 = line } }
++            }, nil)
+             llama_backend_init()
+             backendInitDone = true
+         }
+@@ -156,10 +175,13 @@ final class LlamaCppVLM: @unchecked Sendable {
          mmprojPath: String? = nil,
          nThreads: Int32 = Int32(ProcessInfo.processInfo.activeProcessorCount),
          contextSize: UInt32 = 4096,
@@ -210,7 +250,7 @@ index db485dc..23805b6 100644
          Self.ensureBackendInit()
  
          // 1. Load the text LLM. Default params enable mmap on iOS
-@@ -173,6 +184,18 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -173,6 +195,21 @@ final class LlamaCppVLM: @unchecked Sendable {
          }
          self.model = m
  
@@ -218,10 +258,13 @@ index db485dc..23805b6 100644
 +        //     their model, so the failure paths below that free the model
 +        //     only clear this handle (deinit would otherwise free it twice).
 +        if let loraPath {
++            Self.lastNativeError.withLock { $0 = nil }
 +            guard let adapter = llama_adapter_lora_init(m, loraPath) else {
 +                llama_model_free(m)
 +                self.model = nil
-+                throw LlamaCppError.loraLoadFailed((loraPath as NSString).lastPathComponent)
++                let name = (loraPath as NSString).lastPathComponent
++                let reason = Self.lastNativeError.withLock { $0 } ?? "is it built for this base model?"
++                throw LlamaCppError.loraLoadFailed("\(name) (\(reason))")
 +            }
 +            self.loraAdapter = adapter
 +        }
@@ -229,7 +272,7 @@ index db485dc..23805b6 100644
          // 2. Create the inference context. n_batch is the max
          //    tokens per llama_decode call; image embeddings can
          //    arrive in larger batches than typical text, so we
-@@ -185,10 +208,18 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -185,10 +222,18 @@ final class LlamaCppVLM: @unchecked Sendable {
          ctxParams.n_threads_batch = nThreads
          guard let c = llama_init_from_model(m, ctxParams) else {
              llama_model_free(m)
@@ -249,7 +292,7 @@ index db485dc..23805b6 100644
  
          // A standalone text GGUF is complete without an mmproj. Keep the
          // llama context and build the normal sampler, then return before the
-@@ -216,7 +247,7 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -216,7 +261,7 @@ final class LlamaCppVLM: @unchecked Sendable {
          guard let mc = mtmd_init_from_file(mmprojPath, m, mtmdParams) else {
              llama_free(c)
              llama_model_free(m)
@@ -258,7 +301,7 @@ index db485dc..23805b6 100644
              throw LlamaCppError.mmprojLoadFailed(mmprojPath)
          }
          self.mtmdCtx = mc
-@@ -229,7 +260,7 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -229,7 +274,7 @@ final class LlamaCppVLM: @unchecked Sendable {
              mtmd_free(mc)
              llama_free(c)
              llama_model_free(m)
@@ -267,7 +310,7 @@ index db485dc..23805b6 100644
              throw LlamaCppError.visionUnsupported
          }
  
-@@ -254,19 +285,33 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -254,19 +299,33 @@ final class LlamaCppVLM: @unchecked Sendable {
          if let s = sampler { llama_sampler_free(s) }
          if let mc = mtmdCtx { mtmd_free(mc) }
          if let c = ctx { llama_free(c) }
@@ -303,7 +346,7 @@ index db485dc..23805b6 100644
              )
          }
          if spec.topK > 0 {
-@@ -318,7 +363,8 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -318,7 +377,8 @@ final class LlamaCppVLM: @unchecked Sendable {
          let ownedSampler: UnsafeMutablePointer<llama_sampler>?
          let samp: UnsafeMutablePointer<llama_sampler>
          if let samplerSpec {
@@ -313,7 +356,7 @@ index db485dc..23805b6 100644
                  throw LlamaCppError.contextInitFailed
              }
              ownedSampler = created
-@@ -417,6 +463,7 @@ final class LlamaCppVLM: @unchecked Sendable {
+@@ -417,6 +477,7 @@ final class LlamaCppVLM: @unchecked Sendable {
              throw LlamaCppError.contextInitFailed
          }
          ctx = c
